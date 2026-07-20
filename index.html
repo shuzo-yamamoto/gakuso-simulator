@@ -62,6 +62,10 @@ canvas#preview{max-width:100%;border-radius:2px;box-shadow:0 4px 20px rgba(0,0,0
 .btn-run{width:100%;padding:13px;background:#1a1a1a;color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:500;cursor:pointer;margin-bottom:1rem;transition:opacity 0.15s}
 .btn-run:hover{opacity:0.85}
 .btn-run:disabled{opacity:0.3;cursor:not-allowed}
+/* v24 Step4: 画像を保存ボタン（設計書§4.2） */
+.btn-save{width:100%;padding:12px;background:#fff;color:#1a1a1a;border:1px solid #1a1a1a;border-radius:10px;font-size:14px;font-weight:500;cursor:pointer;transition:opacity 0.15s}
+.btn-save:hover{opacity:0.7}
+.btn-save:disabled{opacity:0.3;cursor:not-allowed}
 .badge{font-size:11px;padding:2px 8px;border-radius:20px;background:#dbeafe;color:#1d4ed8;margin-left:6px}
 .divider{height:1px;background:#f0f0f0;margin:1.5rem 0}
 .hidden{display:none}
@@ -353,6 +357,15 @@ canvas#preview{max-width:100%;border-radius:2px;box-shadow:0 4px 20px rgba(0,0,0
     <div class="preview-ph" id="ph"><div class="pi">🖼</div><p>設定するとここに<br>プレビューが表示されます</p></div>
     <canvas id="preview" style="display:none"></canvas>
   </div>
+  <!-- v24 Step4: 画像の保存（設計書§4.2） -->
+  <div class="ctrl-box" style="margin-top:12px">
+    <button class="btn-save" id="btn-save" onclick="onClickSave()" disabled>📥 画像を保存（PNG）</button>
+    <div class="radio-row" style="margin-top:8px">
+      <label><input type="checkbox" id="save-caption" checked/>設定情報を含める</label>
+    </div>
+    <div style="font-size:11px;color:#aaa;margin-top:4px">画像の下に日時・額縁種類・作品サイズ・マットや面金の設定を白帯で焼き込みます。外した場合も注意書きは必ず入ります</div>
+    <div id="save-note" style="display:none;font-size:12px;color:#666;margin-top:8px;line-height:1.6"></div>
+  </div>
 </div>
 </div>
 
@@ -400,7 +413,19 @@ let lastHStrip=null;
   - 縦方向周期：約6px（垂直糸の間隔）
   麻地は横糸が太め・縦糸が細めの平織りパターン
 */
-function makeLinenTexture(metalType){
+/*
+  v24 Step4 — 麻地テクスチャの生成規則（設計書§3.5-1）
+
+  ① 固定シードの疑似乱数を使う
+     v23は Math.random() を使っており、描画のたびに織り目が変わっていた。
+     そのままではプレビューとエクスポートで織り目が一致せず、
+     T-10（エクスポート画像とプレビューの内容一致）を満たせないため決定論的に改めた。
+  ② スケール S に追随させる
+     1倍のタイルを作ってから、補間なし（最近傍）で S 倍に画素複製する。
+     補間を使わないので、エクスポートの織り目はプレビューの厳密な S 倍拡大になる。
+*/
+function makeLinenTexture(metalType, S){
+  if(S===undefined) S=1;
   // タイルサイズ（1/10スケール：横糸0.6px→整数で最小2px、縦糸1.2px→整数で最小2px）
   // タイル全体をTW=4, TH=2に縮小して密な織り目を表現
   const TW=4, TH=2;
@@ -441,16 +466,28 @@ function makeLinenTexture(metalType){
   }
 
   // 若干のノイズで布感を追加
+  // 固定シードの疑似乱数（線形合同法）を使う。毎回まったく同じ織り目になる
+  let seed=0x9E3779B9;
+  const rnd=()=>{ seed=(seed*1664525+1013904223)>>>0; return seed/4294967296; };
   const imgData=tctx.getImageData(0,0,TW,TH);
   const d=imgData.data;
   for(let i=0;i<d.length;i+=4){
-    const n=(Math.random()-0.5)*14;
+    const n=(rnd()-0.5)*14;
     d[i]=Math.max(0,Math.min(255,d[i]+n));
     d[i+1]=Math.max(0,Math.min(255,d[i+1]+n));
     d[i+2]=Math.max(0,Math.min(255,d[i+2]+n));
   }
   tctx.putImageData(imgData,0,0);
-  return tc;
+
+  if(S===1) return tc;
+
+  // スケールS倍：補間なしで画素をそのまま複製する
+  const big=document.createElement('canvas');
+  big.width=TW*S; big.height=TH*S;
+  const bctx=big.getContext('2d');
+  bctx.imageSmoothingEnabled=false;
+  bctx.drawImage(tc, 0,0, TW,TH, 0,0, TW*S,TH*S);
+  return big;
 }
 
 // ライナープレビューをカードに描画
@@ -1168,11 +1205,17 @@ function checkReady(){
   こうするとタイルの境目で画素が鏡合わせになり、継ぎ目の不連続が消える。
   mirror=false のときは v23 と全く同じ描画（全タイル正像）を通る。
 */
-function buildLongStrip(tileCanvas, isVertical, targetLen, tileScale, mirror){
+function buildLongStrip(tileCanvas, isVertical, targetLen, tileScale, mirror, S){
+  if(S===undefined) S=1;
   const tw = tileCanvas.width;
   const th = tileCanvas.height;
-  // タイルの繰り返し単位（スケール適用）
-  const step = Math.max(4, Math.round((isVertical ? th : tw) * tileScale));
+  /*
+    タイルの繰り返し単位（スケール適用）
+    ※ S=1 で算出してから S 倍する（設計書§3.5-1）。
+      S倍を忘れると、エクスポート時に辺の長さだけが倍になって
+      タイルの繰り返し数が倍増し、模様が半分のサイズになってしまう。
+  */
+  const step = Math.max(4, Math.round((isVertical ? th : tw) * tileScale)) * S;
   // 必要なタイル数（少し余裕を持つ）
   const count = Math.ceil(targetLen / step) + 1;
   const stripLen = step * count;
@@ -1207,10 +1250,23 @@ function buildLongStrip(tileCanvas, isVertical, targetLen, tileScale, mirror){
   return {strip, step};
 }
 
-function drawPreview(){
-  if(!imgs.art||!imgs.frame||!ftype||!texRect)return;
-  const {sw,sh}=texRect;
+/*
+  ═══════════════════════════════════════════════════════════════
+   v24 Step4 — 描画ロジックの共通関数化（設計書§3.5-1）
+  ═══════════════════════════════════════════════════════════════
+  プレビュー（S=1）とエクスポート（S=2）で同じ描画コードを使うため、
+  「寸法の計算」と「実際の描画」を分ける。
 
+  ■ computeLayout(S) … 寸法をまとめて計算して返す
+  ■ renderFraming(ctx, L) … 受け取った寸法どおりに額装を描く
+
+  【スケール適用の鉄則（設計書§3.5-1）】
+  まず S=1（＝v23と同じ式・同じ丸め順序）で全てのピクセル量を出し、
+  最後に一律 S を掛ける。
+  round(値 × sc × S) のようにスケールを式の内側で掛けてはいけない。
+  丸め誤差で1pxずれ、「縦横きっちり2倍」（T-8）が崩れるため。
+*/
+function computeLayout(S){
   const artWmm=parseInt(document.getElementById('art-w').value)||297;
   const artHmm=parseInt(document.getElementById('art-h').value)||210;
   const Fd=parseInt(document.getElementById('fw').value)||55;
@@ -1219,6 +1275,7 @@ function drawPreview(){
   // テクスチャスケール。無地モードは繰り返し周期が存在しないため常に1固定（設計書§3.2-4）
   const tsPct = frameKind==='plain' ? 1 : (parseInt(document.getElementById('ts').value)||100)/100;
 
+  // ── ここから S=1 の計算（v23と完全に同一）──
   const BASE=380;
   const ratio=artWmm/artHmm;
   let artW,artH;
@@ -1229,13 +1286,43 @@ function drawPreview(){
   const innerPad=matPx+linerPx; // マット or ライナーのどちらか（油彩はライナー）
   const cw=artW+innerPad*2+Fd*2, ch=artH+innerPad*2+Fd*2;
   const sc=Math.min(540/cw,460/ch,1);
-  const W=Math.round(cw*sc), H=Math.round(ch*sc);
-  const F=Math.round(Fd*sc), M=Math.round(innerPad*sc);
-  const iX=F+M, iY=F+M, iW=W-F*2-M*2, iH=H-F*2-M*2;
+  const W1=Math.round(cw*sc), H1=Math.round(ch*sc);
+  const F1=Math.round(Fd*sc), M1=Math.round(innerPad*sc);
+  const iX1=F1+M1, iY1=F1+M1, iW1=W1-F1*2-M1*2, iH1=H1-F1*2-M1*2;
 
+  // 面金の幅（v23は表示倍率scを掛けていない。その挙動は変えずSだけ掛ける）
+  const menkinMM=parseFloat(document.getElementById('menkin-w').value)||3;
+  const MK1=Math.max(1, Math.round(menkinMM*(artW/artWmm)));
+  // ライナー・入子の幅と、その中の金属ラインの幅（同上）
+  const linerMM2=parseInt(document.getElementById('liner-w').value)||20;
+  const LW1=Math.round(linerMM2*(artW/artWmm));
+  const lineW1=Math.max(2, Math.round(LW1*0.15));
+  const linenW1=LW1-lineW1; // 麻地の幅
+
+  // ── 最後に一律 S 倍する ──
+  return {
+    S, tsPct,
+    W:W1*S,   H:H1*S,   F:F1*S,   M:M1*S,
+    iX:iX1*S, iY:iY1*S, iW:iW1*S, iH:iH1*S,
+    MK:MK1*S, LW:LW1*S, lineW:lineW1*S, linenW:linenW1*S
+  };
+}
+
+// プレビュー描画（S=1）。外部から呼ぶ入口はv23から変えていない
+function drawPreview(){
+  if(!imgs.art||!imgs.frame||!ftype||!texRect)return;
+  const L=computeLayout(1);
   const canvas=document.getElementById('preview');
-  canvas.width=W; canvas.height=H;
-  const ctx=canvas.getContext('2d');
+  canvas.width=L.W; canvas.height=L.H;
+  renderFraming(canvas.getContext('2d'), L);
+  document.getElementById('ph').style.display='none';
+  canvas.style.display='block';
+  updateSaveButton();
+}
+
+// 額装本体の描画。プレビューもエクスポートもこの1本を通る
+function renderFraming(ctx, L){
+  const {S,tsPct,W,H,F,M,iX,iY,iW,iH,MK,LW,lineW,linenW}=L;
   ctx.clearRect(0,0,W,H);
 
   // 1. 背景
@@ -1246,10 +1333,12 @@ function drawPreview(){
   // 上下辺用（横方向）：コーナーを除いた内側幅 W-F*2
   // ミラータイリング（処理C）は柄物モードのときだけ適用する（設計書§3.3 適用対象）
   const useMirror = mirrorOn && frameKind==='pattern';
-  const {strip:hStrip} = buildLongStrip(tileTopBot, false, W, tsPct, useMirror);
+  const {strip:hStrip} = buildLongStrip(tileTopBot, false, W, tsPct, useMirror, S);
   // 左右辺用（縦方向）：コーナーを除いた内側高さ H-F*2
-  const {strip:vStrip} = buildLongStrip(tileSide, true, H, tsPct, useMirror);
-  lastHStrip = hStrip; // 検証関数 checkStripUniformity() の評価対象（設計書§7.1）。描画結果には影響しない
+  const {strip:vStrip} = buildLongStrip(tileSide, true, H, tsPct, useMirror, S);
+  // 検証関数 checkStripUniformity() の評価対象（設計書§7.1）。
+  // エクスポート（S=2）の描画で上書きしないよう、プレビュー時だけ保持する
+  if(S===1) lastHStrip = hStrip;
 
   /*
     ── 45°マイターカット 完全2分割方式 ──
@@ -1328,8 +1417,7 @@ function drawPreview(){
 
   // 6b. 面金（外枠-内枠パスで一発塗り → 境界線なし）
   if(M>0 && menkinOn){
-    const menkinMM=parseFloat(document.getElementById('menkin-w').value)||3;
-    const MK=Math.max(1, Math.round(menkinMM*(artW/artWmm)));
+    // MK（面金の幅）は computeLayout() でS倍済み
     const stops=getMenkinStops(menkinColor);
 
     // 面金エリア：iX-MK, iY-MK から iX+iW+MK, iY+iH+MK の矩形枠
@@ -1370,8 +1458,7 @@ function drawPreview(){
 
   // 6c. ライナー・入子（油彩額のみ・作品の外側に描画）
   if(ftype==='yuusai' && linerType!=='none'){
-    const linerMM=parseInt(document.getElementById('liner-w').value)||20;
-    const LW=Math.round(linerMM*(artW/artWmm));
+    // LW（ライナー・入子の幅）は computeLayout() でS倍済み
     const lx=iX-LW, ly=iY-LW, lw=iW+LW*2, lh=iH+LW*2;
     const isLiner=linerType.startsWith('liner');
     const isGold=linerType.endsWith('gold');
@@ -1394,12 +1481,12 @@ function drawPreview(){
            上下ライン：全幅（コーナーまで伸ばす）
            左右ライン：作品の上下座標の間のみ（コーナーに踏み込まない）
       */
-      const lineW=Math.max(2, Math.round(LW*0.15));
-      const linenW=LW-lineW; // 麻地の幅
+      // lineW（金属ラインの幅）・linenW（麻地の幅）は computeLayout() でS倍済み
 
       // 麻地テクスチャ生成（金銀共通、実画像分析に基づく織り目）
+      // スケールSを渡し、織り目もS倍にする（設計書§3.5-1）
       function makeLinenTile(){
-        return makeLinenTexture(linerType.endsWith('gold')?'gold':'silver');
+        return makeLinenTexture(linerType.endsWith('gold')?'gold':'silver', S);
       }
       const linenTile=makeLinenTile();
       const linenPat=ctx.createPattern(linenTile,'repeat');
@@ -1483,9 +1570,254 @@ function drawPreview(){
 
   // 7. 作品
   ctx.drawImage(imgs.art,iX,iY,iW,iH);
+}
 
-  document.getElementById('ph').style.display='none';
-  canvas.style.display='block';
+/*
+  ═══════════════════════════════════════════════════════════════
+   v24 Step4 — 処理E: シミュレート結果のエクスポート（設計書§3.5）
+  ═══════════════════════════════════════════════════════════════
+*/
+
+// エクスポートの倍率（設計書§3.5-1: プレビュー=1、エクスポート=2）
+const EXPORT_SCALE = 2;
+
+// 免責文言（設計書§3.5-3・§8。必須・OFF不可）
+const DISCLAIMER_TEXT = '※本画像はシミュレーションによるイメージです。実物とは色味・質感が異なる場合があります。';
+
+// 端末標準サンセリフ（設計書§3.5-2）
+function exportFontStack(px){
+  return `${px}px -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Yu Gothic UI', sans-serif`;
+}
+
+/*
+  キャプション帯の本文3行を組み立てる（設計書§3.5-2）
+  免責文言は含めない（帯の最下行として別に描く）
+*/
+function buildCaptionLines(now){
+  const artWmm=parseInt(document.getElementById('art-w').value)||297;
+  const artHmm=parseInt(document.getElementById('art-h').value)||210;
+  const p=(n,k)=>String(n).padStart(k,'0');
+
+  // 1行目: 出力日時（yyyy/MM/dd HH:mm）＋「額装シミュレーション（イメージ）」
+  const stamp=`${now.getFullYear()}/${p(now.getMonth()+1,2)}/${p(now.getDate(),2)} `
+            + `${p(now.getHours(),2)}:${p(now.getMinutes(),2)}`;
+  const line1=`${stamp}　額装シミュレーション（イメージ）`;
+
+  // 2行目: 額縁種類、作品サイズ
+  const typeName = ftype==='yuusai' ? '油彩額' : 'デッサン・水彩額';
+  const line2=`${typeName}　作品サイズ ${artWmm}×${artHmm}mm`;
+
+  // 3行目: デッサン水彩＝マット幅・マット色・面金／油彩＝ライナー・入子種類・幅
+  let line3;
+  if(ftype==='yuusai'){
+    if(linerType==='none'){
+      line3='ライナー・入子 なし';
+    } else {
+      const linerMM=parseInt(document.getElementById('liner-w').value)||20;
+      const kind = linerType.startsWith('liner') ? 'ライナー' : '入子';
+      const metal = linerType.endsWith('gold') ? '金' : '銀';
+      line3=`${kind}（${metal}）　幅 ${linerMM}mm`;
+    }
+  } else {
+    const matMM=parseInt(document.getElementById('mat-w').value)||0;
+    let menkin='面金 なし';
+    if(menkinOn){
+      const menkinMM=parseFloat(document.getElementById('menkin-w').value)||3;
+      const NAMES={gold:'ゴールド',silver:'シルバー',brown:'ブラウン',black:'ブラック'};
+      const name=NAMES[menkinColor]||menkinColor.toUpperCase();
+      menkin=`面金 ${name} ${menkinMM}mm`;
+    }
+    line3=`マット幅 ${matMM}mm　マット色 ${matColor.toUpperCase()}　${menkin}`;
+  }
+  return [line1, line2, line3];
+}
+
+/*
+  キャプション帯の寸法を求める（設計書§3.5-2）
+  フォント: エクスポート画像幅の2.2%（四捨五入）、行間1.5
+  帯の高さ: 行高×6（本文3行＋免責1行＋上下パディング各1行分）
+*/
+function captionMetrics(exportW){
+  const fontPx=Math.round(exportW*0.022);
+  const lineH=fontPx*1.5;
+  return {
+    fontPx,
+    lineH,
+    discFontPx: Math.round(fontPx*0.7), // 免責文言は本文の0.7倍（設計書§3.5-3）
+    bandH: lineH*6
+  };
+}
+
+/*
+  キャプション帯を描く（設計書§3.5-2・§3.5-3）
+  白地の帯に黒文字。最下行に免責文言を必ず入れる
+*/
+function drawCaptionBand(ctx, exportW, exportH, bandTop, lines, m){
+  ctx.save();
+  ctx.fillStyle='#ffffff';
+  ctx.fillRect(0, bandTop, exportW, m.bandH);
+
+  ctx.fillStyle='#000000';
+  ctx.textBaseline='middle';
+  ctx.textAlign='left';
+  const padX=Math.round(m.fontPx*0.8);
+
+  // 上パディング1行分のあとに本文3行
+  ctx.font=exportFontStack(m.fontPx);
+  lines.forEach((text,i)=>{
+    ctx.fillText(text, padX, bandTop + m.lineH*(1.5+i));
+  });
+
+  // 4行目: 免責文言（必須・OFF不可）
+  ctx.font=exportFontStack(m.discFontPx);
+  ctx.fillText(DISCLAIMER_TEXT, padX, bandTop + m.lineH*4.5);
+  ctx.restore();
+}
+
+/*
+  キャプション帯OFF時の免責文言（設計書§3.5-3）
+  画像右下に不透明度60%で焼き込む。こちらもOFF不可
+*/
+function drawDisclaimerOverlay(ctx, exportW, exportH){
+  const fontPx=Math.round(exportW*0.022*0.7);
+  ctx.save();
+  ctx.globalAlpha=0.6;
+  ctx.font=exportFontStack(fontPx);
+  ctx.textAlign='right';
+  ctx.textBaseline='bottom';
+  const pad=Math.round(fontPx*0.8);
+  // 白フチを薄く敷いて、暗いフレームの上でも読めるようにする
+  ctx.lineWidth=Math.max(2, Math.round(fontPx*0.25));
+  ctx.strokeStyle='#ffffff';
+  ctx.strokeText(DISCLAIMER_TEXT, exportW-pad, exportH-pad);
+  ctx.fillStyle='#000000';
+  ctx.fillText(DISCLAIMER_TEXT, exportW-pad, exportH-pad);
+  ctx.restore();
+}
+
+/*
+  エクスポート用Canvasを生成する（設計書§3.5-1）
+  プレビューを拡大コピーするのではなく、2倍スケールで描画し直す
+*/
+function renderExportCanvas(withCaption, now){
+  const L=computeLayout(EXPORT_SCALE);
+  const m=captionMetrics(L.W);
+  const bandH = withCaption ? m.bandH : 0;
+
+  const cv=document.createElement('canvas');
+  cv.width=L.W; cv.height=L.H+bandH;
+  const ctx=cv.getContext('2d');
+
+  // 額装本体（プレビューと同じ描画関数を2倍スケールで通す）
+  renderFraming(ctx, L);
+
+  if(withCaption) drawCaptionBand(ctx, L.W, cv.height, L.H, buildCaptionLines(now), m);
+  else            drawDisclaimerOverlay(ctx, L.W, L.H);
+
+  return cv;
+}
+
+// ファイル名（設計書§3.5-4）
+// 例: 額装シミュレーション_297x210mm_20260720-143025.png
+function buildExportFilename(now){
+  const artWmm=parseInt(document.getElementById('art-w').value)||297;
+  const artHmm=parseInt(document.getElementById('art-h').value)||210;
+  const p=(n,k)=>String(n).padStart(k,'0');
+  const ts=`${now.getFullYear()}${p(now.getMonth()+1,2)}${p(now.getDate(),2)}`
+         + `-${p(now.getHours(),2)}${p(now.getMinutes(),2)}${p(now.getSeconds(),2)}`;
+  return `額装シミュレーション_${artWmm}x${artHmm}mm_${ts}.png`;
+}
+
+/*
+  iPad / iPhone 判定（設計書§3.5-5）
+  iOS Safari は 'download' in a が true を返すのに実際には保存できないため、
+  機能検出だけでは分岐できずUAを併用する。
+  iPadOS 13以降はUAがMacと同じになるので、タッチ点数で見分ける。
+*/
+function isIOSDevice(){
+  const ua=navigator.userAgent;
+  return /iPad|iPhone|iPod/.test(ua)
+      || (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
+}
+
+// 保存中の案内メッセージ表示
+function setSaveNote(text, isError){
+  const el=document.getElementById('save-note');
+  el.textContent=text||'';
+  el.style.display=text?'block':'none';
+  el.style.color=isError?'#ef4444':'#666';
+}
+
+/*
+  画像の保存（設計書§3.5-5）
+  Blob URL＋<a download> が基本。効かない環境では新規タブ＋長押し案内
+*/
+function saveExportImage(canvas, filename){
+  const a=document.createElement('a');
+  const needFallback = !('download' in a) || isIOSDevice();
+
+  /*
+    ★ フォールバック用のタブは、利用者のクリック直後（同期処理）に開く。
+      canvas.toBlob() は非同期なので、そのコールバック内で window.open() を
+      呼ぶとポップアップブロックの対象になってしまう（設計書§3.5-5）。
+  */
+  const win = needFallback ? window.open('', '_blank') : null;
+
+  canvas.toBlob(blob=>{
+    if(!blob){
+      setSaveNote('画像の生成に失敗しました。もう一度お試しください。', true);
+      if(win) win.close();
+      return;
+    }
+    const url=URL.createObjectURL(blob);
+    if(needFallback){
+      if(win){
+        win.location.href=url;
+        setSaveNote('画像を新しいタブで開きました。画像を長押しして「”写真”に保存」を選んでください。');
+      } else {
+        // ポップアップがブロックされた場合の最終手段
+        setSaveNote('ポップアップがブロックされました。ブラウザの設定で許可してから、もう一度お試しください。', true);
+      }
+    } else {
+      a.href=url; a.download=filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setSaveNote(`保存しました: ${filename}`);
+    }
+    // Blob URLはしばらく保持してから解放する（新規タブでの表示に間に合わせるため）
+    setTimeout(()=>URL.revokeObjectURL(url), 60000);
+  }, 'image/png');
+}
+
+// 保存ボタンの有効・無効を切り替える（設計書§4.2: 結果表示後のみ有効）
+function updateSaveButton(){
+  const btn=document.getElementById('btn-save');
+  if(!btn)return;
+  const ready = !!(imgs.art && imgs.frame && ftype && texRect);
+  btn.disabled = !ready;
+}
+
+// 「画像を保存」ボタン押下（設計書§4.2）
+function onClickSave(){
+  const btn=document.getElementById('btn-save');
+  const label=btn.textContent;
+  btn.disabled=true;
+  btn.textContent='生成中…';
+  setSaveNote('');
+  // 「生成中…」を画面に反映させてから重い2倍レンダリングに入る
+  setTimeout(()=>{
+    try{
+      const now=new Date();
+      const withCaption=document.getElementById('save-caption').checked;
+      const cv=renderExportCanvas(withCaption, now);
+      saveExportImage(cv, buildExportFilename(now));
+    }catch(e){
+      console.error(e);
+      setSaveNote('画像の生成に失敗しました。もう一度お試しください。', true);
+    }finally{
+      btn.textContent=label;
+      updateSaveButton();
+    }
+  }, 50);
 }
 
 // ページロード時にライナープレビューを初期描画
