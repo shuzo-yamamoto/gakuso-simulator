@@ -48,6 +48,12 @@ h1{font-size:18px;font-weight:600;margin-bottom:1.5rem;color:#1a1a1a}
 .slider-row span{font-size:13px;font-weight:500;min-width:28px;color:#1a1a1a}
 .ctrl-box{padding:10px 12px;background:#f8f8f8;border-radius:8px;margin-top:10px}
 .ctrl-box .cl{font-size:12px;color:#888;margin-bottom:6px}
+/* v24 Step1: フレーム種類ラジオ（設計書§4.1） */
+.radio-row{display:flex;gap:18px;flex-wrap:wrap}
+.radio-row label{font-size:13px;display:flex;align-items:center;gap:5px;cursor:pointer}
+/* v24 Step1: 無地モード時のテクスチャスケール無効表示（設計書§3.2-4） */
+.ctrl-box.disabled{opacity:.45}
+.ctrl-box.disabled input[type=range]{cursor:not-allowed}
 .preview-area{background:#ebebeb;border-radius:12px;padding:1.5rem;display:flex;align-items:center;justify-content:center;min-height:300px}
 canvas#preview{max-width:100%;border-radius:2px;box-shadow:0 4px 20px rgba(0,0,0,0.15)}
 .preview-ph{text-align:center;color:#aaa}
@@ -106,6 +112,15 @@ canvas#preview{max-width:100%;border-radius:2px;box-shadow:0 4px 20px rgba(0,0,0
       <canvas id="tex-canvas"></canvas>
     </div>
   </div>
+  <!-- v24 Step1: フレームの種類（設計書§4.1）既定は「柄物」＝v23と同一動作 -->
+  <div class="ctrl-box" id="frame-kind-box">
+    <div class="cl">フレームの種類</div>
+    <div class="radio-row">
+      <label><input type="radio" name="frame-kind" value="pattern" checked onchange="setFrameKind('pattern')"/>柄物（模様あり）</label>
+      <label><input type="radio" name="frame-kind" value="plain" onchange="setFrameKind('plain')"/>無地（単色・シンプル）</label>
+    </div>
+    <div style="font-size:11px;color:#aaa;margin-top:4px">無地を選ぶと、辺の断面プロファイル（1画素幅の色の並び）を長手方向に押し出して貼ります。撮影ノイズの繰り返し・タイルの継ぎ目が原理的に出ません</div>
+  </div>
   <div class="ctrl-box">
     <div class="cl">フレーム幅（表示の太さ）</div>
     <div class="slider-row">
@@ -113,13 +128,15 @@ canvas#preview{max-width:100%;border-radius:2px;box-shadow:0 4px 20px rgba(0,0,0
       <span id="fw-v">55</span><span class="unit">px</span>
     </div>
   </div>
-  <div class="ctrl-box" style="margin-top:8px">
+  <div class="ctrl-box" style="margin-top:8px" id="ts-box">
     <div class="cl">テクスチャスケール（模様の繰り返しサイズ）— デコラティブな額は小さく調整</div>
     <div class="slider-row">
       <input type="range" min="10" max="200" value="100" id="ts" step="1" oninput="document.getElementById('ts-v').textContent=this.value;drawPreview()"/>
       <span id="ts-v">100</span><span class="unit">%</span>
     </div>
     <div style="font-size:11px;color:#aaa;margin-top:4px">100%=切り出しサイズそのまま　小さくすると模様が縮んで繰り返される　大きくすると引き伸ばされる</div>
+    <!-- v24 Step1: 無地モードでは繰り返し周期が存在しないため無効（設計書§3.2-4） -->
+    <div id="ts-disabled-note" style="display:none;font-size:11px;color:#d97706;margin-top:4px">無地モードでは繰り返し周期が存在しないため、この設定は使用しません</div>
   </div>
 </div>
 
@@ -319,6 +336,18 @@ canvas#preview{max-width:100%;border-radius:2px;box-shadow:0 4px 20px rgba(0,0,0
 let ftype='', matColor='#ffffff';
 // ライナー・入子設定
 let linerType='none';
+
+/*
+  v24 Step1 — フレームの種類（設計書§4.1）
+  'pattern' … 柄物（模様あり）。v23と完全に同じ処理を通る（後方互換）
+  'plain'   … 無地（単色・シンプル）。処理B プロファイル押し出しを適用
+  既定は 'pattern'。
+*/
+let frameKind='pattern';
+
+// 検証関数 checkStripUniformity() 用に、最後に生成した上辺ロングストリップを保持する
+// （設計書§7.1「生成済み辺テクスチャ（上辺用ロングストリップ）」を評価対象とするため）
+let lastHStrip=null;
 
 /*
   麻地テクスチャ生成（画像分析に基づく）
@@ -586,7 +615,166 @@ function resetPick(){
   転置後のサイズ：幅=sh, 高さ=sw
   左辺・右辺に縦タイリングで配置
 */
-function buildTex(){
+/*
+  ═══════════════════════════════════════════════════════════════
+   v24 Step1 — 処理B: プロファイル押し出し（設計書§3.2）
+  ═══════════════════════════════════════════════════════════════
+  無地（単色・シンプル）のフレームでは、切り出し帯をそのまま繰り返し貼ると
+  撮影ノイズや照明ムラまで一緒に繰り返されてしまう。
+  そこで「断面方向（フレームの厚み方向）の色の並び」だけを統計的に求め、
+  それを長手方向にまっすぐ押し出したテクスチャに置き換える。
+  → 長手方向に完全一様になるため、明暗の縞も継ぎ目も原理的にゼロになる。
+*/
+
+/*
+  トリム平均（設計書§3.2-2）
+  ─────────────────────────────────────────────────────────────
+  値を昇順に並べ、下位10%・上位10%（それぞれ floor(n×0.1) 個）を除外し、
+  残りの算術平均を四捨五入して整数で返す。
+  目的：撮影時の映り込み・ホコリ等の外れ値を落とすため。
+
+  ※ n≧1 のとき floor(n×0.1)×2 < n が常に成り立つので、
+    除外後に残る画素数は必ず1個以上になる（0除算は起きない）。
+*/
+function trimmedMean(values){
+  const n=values.length;
+  values.sort((a,b)=>a-b);           // 昇順に並べる
+  const cut=Math.floor(n*0.1);       // 上下それぞれ除外する個数
+  let sum=0;
+  for(let i=cut;i<n-cut;i++) sum+=values[i];
+  return Math.round(sum/(n-cut*2));  // 端数処理は四捨五入（設計書§8）
+}
+
+/*
+  プロファイル列の生成（設計書§3.2-1・§3.2-2）
+  ─────────────────────────────────────────────────────────────
+  src(sw×sh) の長手方向を判定し、断面方向の各位置について
+  長手方向に並ぶ全画素のトリム平均（RGB各チャンネル独立）を求める。
+
+  長手方向の判定（設計書§2）：
+    sw ≥ sh → 横帯（長手＝x方向、断面＝y方向）→ プロファイルは sh 個
+    sw < sh → 縦帯（長手＝y方向、断面＝x方向）→ プロファイルは sw 個
+
+  戻り値: {prof, isHorizontal}
+    prof … RGBA×断面位置数 の Uint8ClampedArray
+*/
+function buildProfileColumn(src, sw, sh){
+  const px=src.getContext('2d').getImageData(0,0,sw,sh).data;
+  const isHorizontal = sw>=sh;                 // 横帯かどうか
+  const crossN = isHorizontal ? sh : sw;       // 断面方向の位置数
+  const longN  = isHorizontal ? sw : sh;       // 長手方向の画素数（＝平均を取る母数）
+
+  const prof=new Uint8ClampedArray(crossN*4);
+  // 1断面ぶんの画素値を貯めるバッファ（毎回使い回して確保コストを抑える）
+  const bufR=new Float64Array(longN);
+  const bufG=new Float64Array(longN);
+  const bufB=new Float64Array(longN);
+
+  for(let i=0;i<crossN;i++){
+    for(let j=0;j<longN;j++){
+      // 横帯なら (x,y)=(j,i)、縦帯なら (x,y)=(i,j)
+      const x = isHorizontal ? j : i;
+      const y = isHorizontal ? i : j;
+      const p=(y*sw+x)*4;
+      bufR[j]=px[p]; bufG[j]=px[p+1]; bufB[j]=px[p+2];
+    }
+    const o=i*4;
+    prof[o]  =trimmedMean(bufR);
+    prof[o+1]=trimmedMean(bufG);
+    prof[o+2]=trimmedMean(bufB);
+    prof[o+3]=255; // 元画像は不透明なのでαは255固定
+  }
+  return {prof, isHorizontal};
+}
+
+/*
+  プロファイル列の押し出し（設計書§3.2-3）
+  ─────────────────────────────────────────────────────────────
+  プロファイル列を長手方向に複製し、元の切り出し帯と同じ sw×sh のテクスチャにする。
+  サイズを元と同じに揃えることで、この後の転置処理・タイリング（tileTopBot /
+  tileSide / buildLongStrip）・フレーム幅自動設定を v23 のまま流用できる。
+
+  ※ drawImage による拡大ではなく画素を直接複製する。
+    拡大時の補間で端の画素がわずかに滲むのを避け、長手方向の完全一様
+    （＝ΔY=0）を保証するため。
+*/
+function extrudeProfile(prof, isHorizontal, sw, sh){
+  const out=document.createElement('canvas');
+  out.width=sw; out.height=sh;
+  const octx=out.getContext('2d');
+  const img=octx.createImageData(sw,sh);
+  const d=img.data;
+  for(let y=0;y<sh;y++){
+    for(let x=0;x<sw;x++){
+      // 横帯なら断面位置＝y、縦帯なら断面位置＝x
+      const o=(isHorizontal ? y : x)*4;
+      const p=(y*sw+x)*4;
+      d[p]=prof[o]; d[p+1]=prof[o+1]; d[p+2]=prof[o+2]; d[p+3]=prof[o+3];
+    }
+  }
+  octx.putImageData(img,0,0);
+  return out;
+}
+
+/*
+  フレーム種類の切替（設計書§4.1）
+  切替時はテクスチャを作り直して即時再描画する。
+  フレーム幅は利用者が調整済みの値を尊重するため、自動設定し直さない。
+*/
+function setFrameKind(kind){
+  frameKind=kind;
+  updateTexScaleUI();
+  if(pts.length>=2){
+    buildTex(false); // false = フレーム幅の自動設定をしない
+    drawPreview();
+  }
+}
+
+/*
+  テクスチャスケールUIの有効/無効切替（設計書§3.2-4）
+  無地モードはプロファイル押し出しのため繰り返し周期が存在しない → グレーアウト
+*/
+function updateTexScaleUI(){
+  const plain = (frameKind==='plain');
+  document.getElementById('ts').disabled = plain;
+  document.getElementById('ts-box').classList.toggle('disabled', plain);
+  document.getElementById('ts-disabled-note').style.display = plain ? 'block' : 'none';
+}
+
+/*
+  定量検証関数（設計書§7.1）
+  ─────────────────────────────────────────────────────────────
+  最後に生成した上辺用ロングストリップについて、長手方向の位置ごとの
+  平均輝度 Y = 0.299R + 0.587G + 0.114B を求め、その最大値−最小値（ΔY）を返す。
+  8bit輝度スケール（0〜255）で評価する。
+  ブラウザのコンソールから checkStripUniformity() で実行できる。
+*/
+function checkStripUniformity(){
+  if(!lastHStrip){
+    console.warn('先にシミュレーションを実行してください（辺テクスチャが未生成です）');
+    return null;
+  }
+  const w=lastHStrip.width, h=lastHStrip.height;
+  const d=lastHStrip.getContext('2d').getImageData(0,0,w,h).data;
+  let min=Infinity, max=-Infinity;
+  for(let x=0;x<w;x++){
+    let sum=0;
+    for(let y=0;y<h;y++){
+      const p=(y*w+x)*4;
+      sum += 0.299*d[p] + 0.587*d[p+1] + 0.114*d[p+2];
+    }
+    const avg=sum/h;
+    if(avg<min) min=avg;
+    if(avg>max) max=avg;
+  }
+  const dY=max-min;
+  console.log(`ΔY = ${dY.toFixed(3)}　（最大 ${max.toFixed(2)} / 最小 ${min.toFixed(2)} / ストリップ幅 ${w}px）`);
+  return dY;
+}
+window.checkStripUniformity=checkStripUniformity;
+
+function buildTex(autoSetFw){
+  if(autoSetFw===undefined) autoSetFw=true; // 既定は従来どおりフレーム幅を自動設定
   if(pts.length<2)return;
   const fi=imgs.frame;
   const sx=Math.round(Math.min(pts[0].x,pts[1].x));
@@ -599,13 +787,26 @@ function buildTex(){
   const raw=document.createElement('canvas');
   raw.width=sw; raw.height=sh;
   raw.getContext('2d').drawImage(fi, sx,sy,sw,sh, 0,0,sw,sh);
-  texRect={canvas:raw,sw,sh};
-  tileTopBot=raw;
+
+  /*
+    v24 Step1 — フレーム種類による前処理（設計書§3.2）
+    ・柄物（pattern）… base = raw。v23と完全に同一の画素がこの先へ流れる（後方互換）
+    ・無地（plain）  … 処理B プロファイル押し出しを適用した sw×sh テクスチャに差し替える
+    ※ 照明ムラ補正（処理A）はStep 2で、この直前に挿入する
+  */
+  let base=raw;
+  if(frameKind==='plain'){
+    const {prof,isHorizontal}=buildProfileColumn(raw,sw,sh);
+    base=extrudeProfile(prof,isHorizontal,sw,sh);
+  }
+
+  texRect={canvas:base,sw,sh};
+  tileTopBot=base;
 
   // 転置Canvas生成
   // src(x,y) → dst(y,x)
   // dstのサイズ = 幅sh × 高さsw
-  const srcCtx=raw.getContext('2d');
+  const srcCtx=base.getContext('2d');
   const srcPx=srcCtx.getImageData(0,0,sw,sh);
   const dst=document.createElement('canvas');
   dst.width=sh; dst.height=sw;
@@ -625,18 +826,21 @@ function buildTex(){
   tileSide=dst; // 幅=sh, 高さ=sw
 
   // フレーム幅自動設定（sh/元画像高さ の比率から推定）
-  const autoFw=Math.round(sh/fi.height*300);
-  const fw=Math.min(Math.max(autoFw,15),110);
-  document.getElementById('fw').value=fw;
-  document.getElementById('fw-v').textContent=fw;
+  // ※ 種類切替による再生成時（autoSetFw=false）は、利用者の調整値を上書きしない
+  if(autoSetFw){
+    const autoFw=Math.round(sh/fi.height*300);
+    const fw=Math.min(Math.max(autoFw,15),110);
+    document.getElementById('fw').value=fw;
+    document.getElementById('fw-v').textContent=fw;
+  }
 
-  // プレビュー表示
+  // プレビュー表示（設計書§4.1「補正後プレビュー」＝処理適用後のテクスチャを表示する）
   const tc=document.getElementById('tex-canvas');
   const maxTW=Math.min(sw, document.querySelector('.sim').clientWidth-60);
   const tsc=maxTW/sw;
   tc.width=Math.round(sw*tsc); tc.height=Math.round(sh*tsc);
   tc.style.height=Math.round(sh*tsc)+'px';
-  tc.getContext('2d').drawImage(raw,0,0,tc.width,tc.height);
+  tc.getContext('2d').drawImage(base,0,0,tc.width,tc.height);
   document.getElementById('tex-box').style.display='block';
 }
 
@@ -757,7 +961,8 @@ function drawPreview(){
   const Fd=parseInt(document.getElementById('fw').value)||55;
   const matMM=ftype==='dessin'?parseInt(document.getElementById('mat-w').value)||0:0;
   const linerMM=(ftype==='yuusai'&&linerType!=='none')?parseInt(document.getElementById('liner-w').value)||20:0;
-  const tsPct=(parseInt(document.getElementById('ts').value)||100)/100;
+  // テクスチャスケール。無地モードは繰り返し周期が存在しないため常に1固定（設計書§3.2-4）
+  const tsPct = frameKind==='plain' ? 1 : (parseInt(document.getElementById('ts').value)||100)/100;
 
   const BASE=380;
   const ratio=artWmm/artHmm;
@@ -787,6 +992,7 @@ function drawPreview(){
   const {strip:hStrip} = buildLongStrip(tileTopBot, false, W, tsPct);
   // 左右辺用（縦方向）：コーナーを除いた内側高さ H-F*2
   const {strip:vStrip} = buildLongStrip(tileSide, true, H, tsPct);
+  lastHStrip = hStrip; // 検証関数 checkStripUniformity() の評価対象（設計書§7.1）。描画結果には影響しない
 
   /*
     ── 45°マイターカット 完全2分割方式 ──
@@ -1026,7 +1232,7 @@ function drawPreview(){
 }
 
 // ページロード時にライナープレビューを初期描画
-window.addEventListener('load', ()=>{ updateLinenPreviews(); });
+window.addEventListener('load', ()=>{ updateLinenPreviews(); updateTexScaleUI(); });
 </script>
 </body>
 </html>
