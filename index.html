@@ -71,6 +71,8 @@ canvas#preview{max-width:100%;border-radius:2px;box-shadow:0 4px 20px rgba(0,0,0
 .hidden{display:none}
 .reset-btn{font-size:12px;padding:4px 10px;border:1px solid #ddd;border-radius:6px;background:#fff;color:#666;cursor:pointer;margin-top:6px;transition:all 0.15s}
 .reset-btn:hover{background:#f0f0f0}
+.reset-btn:disabled{opacity:0.35;cursor:not-allowed}
+.reset-btn+.reset-btn{margin-left:6px}
 </style>
 </head>
 <body>
@@ -104,10 +106,19 @@ canvas#preview{max-width:100%;border-radius:2px;box-shadow:0 4px 20px rgba(0,0,0
   </div>
   <div id="picker-area" class="picker-wrap hidden">
     <div class="picker-header">
-      <p>フレームの<strong>辺テクスチャ部分</strong>を2点クリックで囲んでください<br>
+      <!-- v24 Step3: 指定方法の切替（設計書§3.4-4・§4.1）既定は2点＝v23と同じ挙動 -->
+      <div class="radio-row" style="margin-bottom:8px">
+        <label><input type="radio" name="pick-mode" value="2point" checked onchange="setPickMode('2point')"/>2点で囲む（正対画像向け）</label>
+        <label><input type="radio" name="pick-mode" value="4point" onchange="setPickMode('4point')"/>4隅を指定（斜め撮影向け）</label>
+      </div>
+      <p id="pick-help-2point">フレームの<strong>辺テクスチャ部分</strong>を2点クリックで囲んでください<br>
       <strong style="color:#ef4444">① 左上の点</strong> → <strong style="color:#22c55e">② 右下の点</strong><br>
       <span style="font-size:11px">囲んだ矩形テクスチャを四辺に配置します</span></p>
+      <p id="pick-help-4point" style="display:none">斜めに写ったフレーム辺の<strong>四隅</strong>を、次の順にクリックしてください<br>
+      <strong style="color:#ef4444">① 左上</strong> → <strong style="color:#f97316">② 右上</strong> → <strong style="color:#f97316">③ 右下</strong> → <strong style="color:#22c55e">④ 左下</strong><br>
+      <span style="font-size:11px">囲んだ四辺形をまっすぐな長方形に直してから四辺に配置します</span></p>
       <div class="pick-status" id="pick-status">① 辺テクスチャの左上をクリック</div>
+      <button class="reset-btn" id="undo-btn" onclick="undoPick()" disabled>1つ戻す</button>
       <button class="reset-btn" onclick="resetPick()">やり直し</button>
     </div>
     <canvas id="pick-canvas"></canvas>
@@ -550,6 +561,16 @@ function getMenkinStops(mc){
 let imgs={frame:null,art:null};
 let pts=[], pickScale=1;
 let texRect=null;
+
+/*
+  v24 Step3 — 辺テクスチャの指定方法（設計書§3.4-4・§4.1）
+  '2point' … 2点で矩形を囲む。v23と同じ挙動（既定）
+  '4point' … フレーム辺の4隅を指定し、射影変換で長方形に矯正する
+*/
+let pickMode='2point';
+
+// 指定方法ごとに必要な点の数
+function requiredPoints(){ return pickMode==='4point' ? 4 : 2; }
 // 四辺用タイルCanvas
 let tileTopBot=null; // 上辺・下辺用：sw×sh（元テクスチャそのまま）
 let tileSide=null;   // 左辺・右辺用：sh×sw（転置済み）
@@ -602,6 +623,7 @@ function loadFrameImg(input){
       document.getElementById('box-frame').classList.add('ok');
       document.getElementById('tex-box').style.display='none';
       setupPickCanvas(img);
+      updatePickStatus(); // 案内文と「1つ戻す」の状態を初期化
       show('picker-area');
       checkReady();
     };
@@ -625,16 +647,32 @@ function redrawPick(){
   const ctx=pc.getContext('2d');
   ctx.clearRect(0,0,pc.width,pc.height);
   ctx.drawImage(imgs.frame,0,0,pc.width,pc.height);
+
+  // ── 4点指定：確定前でも指定済みの点を線でつないで見せる（設計書§4.1）──
+  if(pickMode==='4point' && pts.length>=2){
+    ctx.beginPath();
+    pts.forEach((p,i)=>{
+      const dx=p.x/pickScale, dy=p.y/pickScale;
+      if(i===0) ctx.moveTo(dx,dy); else ctx.lineTo(dx,dy);
+    });
+    if(pts.length===4) ctx.closePath();
+    ctx.strokeStyle='#facc15'; ctx.lineWidth=2; ctx.stroke();
+    if(pts.length===4){ ctx.fillStyle='rgba(255,255,0,0.2)'; ctx.fill(); }
+  }
+
   pts.forEach((p,i)=>{
     const dx=p.x/pickScale, dy=p.y/pickScale;
     ctx.beginPath(); ctx.arc(dx,dy,7,0,Math.PI*2);
-    ctx.fillStyle=i===0?'#ef4444':'#22c55e'; ctx.fill();
+    // 最初の点は赤、最後の点は緑、途中は橙（順番が分かるように色分け）
+    ctx.fillStyle = i===0 ? '#ef4444' : (i===requiredPoints()-1 ? '#22c55e' : '#f97316');
+    ctx.fill();
     ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
     ctx.fillStyle='#fff'; ctx.font='bold 11px sans-serif';
     ctx.textAlign='center'; ctx.textBaseline='middle';
     ctx.fillText(i+1,dx,dy);
   });
-  if(pts.length===2){
+
+  if(pickMode==='2point' && pts.length===2){
     const x0=Math.min(pts[0].x,pts[1].x)/pickScale;
     const y0=Math.min(pts[0].y,pts[1].y)/pickScale;
     const rw=Math.abs(pts[1].x-pts[0].x)/pickScale;
@@ -644,8 +682,56 @@ function redrawPick(){
   }
 }
 
+/*
+  指定の進み具合に応じた案内文（設計書§4.1）
+  4点指定では、次にどの隅をクリックすればよいかを都度示す
+*/
+function pickStatusText(){
+  const n=pts.length;
+  if(pickMode==='4point'){
+    const NAMES=['① 辺の左上の隅をクリック','② 右上の隅をクリック','③ 右下の隅をクリック','④ 左下の隅をクリック'];
+    return n>=4 ? '✅ 4隅を確定 — やり直す場合は「やり直し」' : NAMES[n];
+  }
+  const NAMES=['① 辺テクスチャの左上をクリック','② 辺テクスチャの右下をクリック'];
+  return n>=2 ? '✅ テクスチャ確定 — やり直す場合は「やり直し」' : NAMES[n];
+}
+
+// 案内文と「1つ戻す」ボタンの状態を更新する
+function updatePickStatus(){
+  const el=document.getElementById('pick-status');
+  el.textContent=pickStatusText();
+  el.className = pts.length>=requiredPoints() ? 'pick-status done' : 'pick-status';
+  const undo=document.getElementById('undo-btn');
+  if(undo) undo.disabled = pts.length===0;
+}
+
+/*
+  指定方法の切替（設計書§3.4-4・§4.1）
+  必要な点数が変わるため、指定済みの点はクリアする
+*/
+function setPickMode(mode){
+  pickMode=mode;
+  document.getElementById('pick-help-2point').style.display = mode==='2point' ? 'block' : 'none';
+  document.getElementById('pick-help-4point').style.display = mode==='4point' ? 'block' : 'none';
+  resetPick();
+}
+
+/*
+  直前に指定した点を1つ取り消す（設計書§4.1）
+  4隅指定は誤クリックのリスクが高いため、全消しせずに1手だけ戻せるようにする
+*/
+function undoPick(){
+  if(pts.length===0) return;
+  pts.pop();
+  // 点が足りなくなるので、確定済みのテクスチャは一度破棄する
+  texRect=null; tileTopBot=null; tileSide=null;
+  document.getElementById('tex-box').style.display='none';
+  redrawPick(); updatePickStatus(); checkReady();
+}
+
 function onPickClick(e){
-  if(pts.length>=2)return;
+  const need=requiredPoints();
+  if(pts.length>=need)return;
   const pc=document.getElementById('pick-canvas');
   const rect=pc.getBoundingClientRect();
   const ds=pc.width/rect.width;
@@ -654,12 +740,8 @@ function onPickClick(e){
     y:Math.round((e.clientY-rect.top)*ds*pickScale)
   });
   redrawPick();
-  if(pts.length===1){
-    document.getElementById('pick-status').textContent='② 辺テクスチャの右下をクリック';
-    document.getElementById('pick-status').className='pick-status';
-  } else {
-    document.getElementById('pick-status').textContent='✅ テクスチャ確定 — やり直す場合は「やり直し」';
-    document.getElementById('pick-status').className='pick-status done';
+  updatePickStatus();
+  if(pts.length>=need){
     buildTex();
     checkReady();
     drawPreview();
@@ -668,10 +750,10 @@ function onPickClick(e){
 
 function resetPick(){
   pts=[]; texRect=null; tileTopBot=null; tileSide=null;
-  document.getElementById('pick-status').textContent='① 辺テクスチャの左上をクリック';
-  document.getElementById('pick-status').className='pick-status';
   document.getElementById('tex-box').style.display='none';
-  redrawPick(); checkReady();
+  if(imgs.frame) redrawPick();
+  updatePickStatus();
+  checkReady();
 }
 
 /*
@@ -692,6 +774,144 @@ function resetPick(){
   転置後のサイズ：幅=sh, 高さ=sw
   左辺・右辺に縦タイリングで配置
 */
+/*
+  ═══════════════════════════════════════════════════════════════
+   v24 Step3 — 処理D: 4点パース補正（設計書§3.4）
+  ═══════════════════════════════════════════════════════════════
+  正面から撮れていない写真では、フレームの辺が画像の中で斜めになる。
+  そのまま矩形で切り出すと、辺と平行にならず台形のまま貼られてしまう。
+
+  そこで利用者にフレーム辺の4隅（左上→右上→右下→左下）を指定してもらい、
+  その四辺形を「まっすぐな長方形」に引き伸ばして切り出す。
+  この工程は切り出し帯を作る作業そのものなので、処理A（照明ムラ補正）より前に行う。
+*/
+
+/*
+  8元連立一次方程式をガウス消去法（部分ピボット選択つき）で解く
+  ─────────────────────────────────────────────────────────────
+  A … 係数行列（n行 × n+1列。最終列が右辺）
+  戻り値: 解の配列。解けない場合は null
+*/
+function solveLinearSystem(A, n){
+  for(let col=0; col<n; col++){
+    // 部分ピボット選択：この列で絶対値が最大の行を選んで入れ替える
+    // （割る数が極端に小さくなって精度が落ちるのを防ぐため）
+    let piv=col;
+    for(let r=col+1;r<n;r++) if(Math.abs(A[r][col])>Math.abs(A[piv][col])) piv=r;
+    if(Math.abs(A[piv][col])<1e-12) return null; // ほぼ0 → 解けない（4点が一直線など）
+    if(piv!==col){ const t=A[piv]; A[piv]=A[col]; A[col]=t; }
+
+    // 対角を1にする
+    const d=A[col][col];
+    for(let c=col;c<=n;c++) A[col][c]/=d;
+
+    // 他の行からこの列を消す
+    for(let r=0;r<n;r++){
+      if(r===col) continue;
+      const f=A[r][col];
+      if(f===0) continue;
+      for(let c=col;c<=n;c++) A[r][c]-=f*A[col][c];
+    }
+  }
+  const x=new Array(n);
+  for(let i=0;i<n;i++) x[i]=A[i][n];
+  return x;
+}
+
+/*
+  ホモグラフィ（射影変換）を求める（設計書§3.4-2）
+  ─────────────────────────────────────────────────────────────
+  dst（出力長方形の4隅）→ src（元画像の四辺形の4隅）の写像を求める。
+  出力の各画素から元画像の座標を逆引きするため、この向きで解く。
+
+    x = (a·u + b·v + c) / (g·u + h·v + 1)
+    y = (d·u + e·v + f) / (g·u + h·v + 1)
+
+  未知数は a〜h の8個。4組の対応点から次の8本の式が立つ。
+
+    a·u + b·v + c                 − g·u·x − h·v·x = x
+                    d·u + e·v + f − g·u·y − h·v·y = y
+
+  戻り値: [a,b,c,d,e,f,g,h] または null
+*/
+function solveHomography(dst, src){
+  const M=[];
+  for(let i=0;i<4;i++){
+    const u=dst[i].x, v=dst[i].y;
+    const x=src[i].x, y=src[i].y;
+    M.push([u, v, 1, 0, 0, 0, -u*x, -v*x, x]);
+    M.push([0, 0, 0, u, v, 1, -u*y, -v*y, y]);
+  }
+  return solveLinearSystem(M, 8);
+}
+
+/*
+  四辺形を長方形に矯正して切り出す（設計書§3.4-2・§3.4-3）
+  ─────────────────────────────────────────────────────────────
+  img  … 元画像
+  quad … [左上, 右上, 右下, 左下] の4点（元画像の座標）
+  戻り値: {canvas, w, h} 矯正後の長方形。解けない場合は null
+
+  出力サイズ（設計書§3.4-3）
+    幅   = 上辺・下辺の長さの平均（四捨五入）
+    高さ = 左辺・右辺の長さの平均（四捨五入）
+*/
+function warpQuadToRect(img, quad){
+  const dist=(a,b)=>Math.hypot(b.x-a.x, b.y-a.y);
+  const W=Math.round( (dist(quad[0],quad[1]) + dist(quad[3],quad[2])) / 2 ); // 上辺・下辺
+  const H=Math.round( (dist(quad[0],quad[3]) + dist(quad[1],quad[2])) / 2 ); // 左辺・右辺
+  if(W<2 || H<2) return null;
+
+  // 出力長方形の4隅（左上→右上→右下→左下）を、指定した4点に対応させる
+  const dstCorners=[{x:0,y:0},{x:W,y:0},{x:W,y:H},{x:0,y:H}];
+  const Hm=solveHomography(dstCorners, quad);
+  if(!Hm) return null;
+  const [a,b,c,d,e,f,g,h]=Hm;
+
+  // 元画像を一度だけ配列に取り出す（画素ごとにdrawImageすると極端に遅いため）
+  const sc=document.createElement('canvas');
+  sc.width=img.width; sc.height=img.height;
+  sc.getContext('2d').drawImage(img,0,0);
+  const sw=img.width, sh=img.height;
+  const sd=sc.getContext('2d').getImageData(0,0,sw,sh).data;
+
+  const out=document.createElement('canvas');
+  out.width=W; out.height=H;
+  const octx=out.getContext('2d');
+  const oimg=octx.createImageData(W,H);
+  const od=oimg.data;
+
+  // 範囲外は端の画素値を延長する（設計書§3.4-2）
+  const cx=x=>x<0?0:(x>sw-1?sw-1:x);
+  const cy=y=>y<0?0:(y>sh-1?sh-1:y);
+
+  for(let v=0; v<H; v++){
+    for(let u=0; u<W; u++){
+      const wgt=g*u + h*v + 1;
+      const x=(a*u + b*v + c)/wgt;   // 元画像の座標（小数）
+      const y=(d*u + e*v + f)/wgt;
+
+      // ── バイリニア補間（設計書§3.4-2）──
+      // 周囲4画素を、距離に応じた重みで混ぜる
+      const x0=Math.floor(x), y0=Math.floor(y);
+      const fx=x-x0, fy=y-y0;
+      const x0c=cx(x0), x1c=cx(x0+1), y0c=cy(y0), y1c=cy(y0+1);
+      const p00=(y0c*sw+x0c)*4, p10=(y0c*sw+x1c)*4;
+      const p01=(y1c*sw+x0c)*4, p11=(y1c*sw+x1c)*4;
+      const w00=(1-fx)*(1-fy), w10=fx*(1-fy), w01=(1-fx)*fy, w11=fx*fy;
+
+      const o=(v*W+u)*4;
+      for(let ch=0; ch<3; ch++){
+        // 画素値は四捨五入で整数化（設計書§3.4-2・§8）
+        od[o+ch]=Math.round(sd[p00+ch]*w00 + sd[p10+ch]*w10 + sd[p01+ch]*w01 + sd[p11+ch]*w11);
+      }
+      od[o+3]=255; // 元画像は不透明
+    }
+  }
+  octx.putImageData(oimg,0,0);
+  return {canvas:out, w:W, h:H};
+}
+
 /*
   ═══════════════════════════════════════════════════════════════
    v24 Step2 — 処理A: 照明ムラ補正（設計書§3.1）
@@ -942,7 +1162,7 @@ function setFrameKind(kind){
   フレーム幅は利用者が調整済みの値を尊重するため、自動設定し直さない。
 */
 function rebuildAndRedraw(){
-  if(pts.length>=2){
+  if(pts.length>=requiredPoints()){
     buildTex(false); // false = フレーム幅の自動設定をしない
     drawPreview();
   }
@@ -1029,18 +1249,38 @@ window.checkStripUniformity=checkStripUniformity;
 
 function buildTex(autoSetFw){
   if(autoSetFw===undefined) autoSetFw=true; // 既定は従来どおりフレーム幅を自動設定
-  if(pts.length<2)return;
+  if(pts.length<requiredPoints())return;
   const fi=imgs.frame;
-  const sx=Math.round(Math.min(pts[0].x,pts[1].x));
-  const sy=Math.round(Math.min(pts[0].y,pts[1].y));
-  const sw=Math.round(Math.abs(pts[1].x-pts[0].x));
-  const sh=Math.round(Math.abs(pts[1].y-pts[0].y));
-  if(sw<2||sh<2)return;
 
-  // 元テクスチャ切り出し
-  const raw=document.createElement('canvas');
-  raw.width=sw; raw.height=sh;
-  raw.getContext('2d').drawImage(fi, sx,sy,sw,sh, 0,0,sw,sh);
+  let raw, sw, sh;
+  if(pickMode==='4point'){
+    /*
+      v24 Step3 — 処理D: 4点パース補正（設計書§3.4）
+      指定された四辺形を射影変換で長方形に矯正し、それを切り出し帯とする。
+      処理A（照明ムラ補正）より前の工程。
+    */
+    const warped=warpQuadToRect(fi, pts);
+    if(!warped){
+      // 4点が一直線に並んでいる等で変換できない場合
+      const el=document.getElementById('pick-status');
+      el.textContent='⚠️ この4点では矯正できません。「やり直し」でもう一度、辺の四隅を囲むように指定してください';
+      el.className='pick-status';
+      return;
+    }
+    raw=warped.canvas; sw=warped.w; sh=warped.h;
+  } else {
+    // ── v23と完全に同一の2点切り出し（後方互換）──
+    const sx=Math.round(Math.min(pts[0].x,pts[1].x));
+    const sy=Math.round(Math.min(pts[0].y,pts[1].y));
+    sw=Math.round(Math.abs(pts[1].x-pts[0].x));
+    sh=Math.round(Math.abs(pts[1].y-pts[0].y));
+    if(sw<2||sh<2)return;
+
+    // 元テクスチャ切り出し
+    raw=document.createElement('canvas');
+    raw.width=sw; raw.height=sh;
+    raw.getContext('2d').drawImage(fi, sx,sy,sw,sh, 0,0,sw,sh);
+  }
 
   let base=raw;
 
