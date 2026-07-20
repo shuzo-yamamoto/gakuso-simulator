@@ -8,3 +8,6 @@ Thumbs.db
 
 # Claude Code ローカル設定
 .claude/settings.local.json
+
+# 開発者向けの内部手順（エンドユーザー向けではないため公開リポジトリに含めない）
+初回指示_ClaudeCode用.md
