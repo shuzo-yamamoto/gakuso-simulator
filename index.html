@@ -696,6 +696,20 @@ function pickStatusText(){
   return n>=2 ? '✅ テクスチャ確定 — やり直す場合は「やり直し」' : NAMES[n];
 }
 
+/*
+  4点指定が使えなかったときの案内表示（設計書§3.4-3）
+  原因ごとに文言を変え、利用者がどう直せばよいか分かるようにする
+*/
+function showPickError(message){
+  const el=document.getElementById('pick-status');
+  el.textContent='⚠️ '+message;
+  el.className='pick-status';
+  // 確定できていないので、テクスチャは持たせない
+  texRect=null; tileTopBot=null; tileSide=null;
+  document.getElementById('tex-box').style.display='none';
+  checkReady();
+}
+
 // 案内文と「1つ戻す」ボタンの状態を更新する
 function updatePickStatus(){
   const el=document.getElementById('pick-status');
@@ -793,12 +807,21 @@ function resetPick(){
   戻り値: 解の配列。解けない場合は null
 */
 function solveLinearSystem(A, n){
+  /*
+    ピボットが「実質ゼロ」かどうかは、係数行列の最大絶対値に対する相対値で判定する（設計書§3.4-3）。
+    座標そのものの項（最大3千程度）と u·x の項（最大900万程度）ではスケールが桁違いなので、
+    絶対値で 1e-12 のような固定閾値を使っても縮退の指標にならないため。
+  */
+  let maxAbs=0;
+  for(let r=0;r<n;r++) for(let c=0;c<=n;c++){ const v=Math.abs(A[r][c]); if(v>maxAbs) maxAbs=v; }
+  const eps = (maxAbs>0 ? maxAbs : 1) * 1e-10;
+
   for(let col=0; col<n; col++){
     // 部分ピボット選択：この列で絶対値が最大の行を選んで入れ替える
     // （割る数が極端に小さくなって精度が落ちるのを防ぐため）
     let piv=col;
     for(let r=col+1;r<n;r++) if(Math.abs(A[r][col])>Math.abs(A[piv][col])) piv=r;
-    if(Math.abs(A[piv][col])<1e-12) return null; // ほぼ0 → 解けない（4点が一直線など）
+    if(Math.abs(A[piv][col])<eps) return null; // ほぼ0 → 解けない（4点が一直線など）
     if(piv!==col){ const t=A[piv]; A[piv]=A[col]; A[col]=t; }
 
     // 対角を1にする
@@ -856,11 +879,78 @@ function solveHomography(dst, src){
     幅   = 上辺・下辺の長さの平均（四捨五入）
     高さ = 左辺・右辺の長さの平均（四捨五入）
 */
-function warpQuadToRect(img, quad){
+/*
+  出力長方形のサイズ（設計書§3.4-3）
+    幅   = 上辺・下辺の長さの平均（四捨五入）
+    高さ = 左辺・右辺の長さの平均（四捨五入）
+*/
+function quadOutputSize(quad){
   const dist=(a,b)=>Math.hypot(b.x-a.x, b.y-a.y);
-  const W=Math.round( (dist(quad[0],quad[1]) + dist(quad[3],quad[2])) / 2 ); // 上辺・下辺
-  const H=Math.round( (dist(quad[0],quad[3]) + dist(quad[1],quad[2])) / 2 ); // 左辺・右辺
-  if(W<2 || H<2) return null;
+  return {
+    W: Math.round( (dist(quad[0],quad[1]) + dist(quad[3],quad[2])) / 2 ),
+    H: Math.round( (dist(quad[0],quad[3]) + dist(quad[1],quad[2])) / 2 )
+  };
+}
+
+// 指定された4点の妥当性チェックの閾値（設計書§3.4-3）
+const QUAD_MIN_SIZE = 20;        // 幅・高さの最小値（元画像座標）
+const QUAD_MIN_AREA_RATIO = 0.25; // 面積 ÷ (幅×高さ) の最小値
+
+/*
+  指定された4点が使えるかを調べる（設計書§3.4-3）
+  ─────────────────────────────────────────────────────────────
+  次の3つをすべて満たす場合のみ処理を続ける。
+
+    a 最小サイズ … 幅・高さがどちらも QUAD_MIN_SIZE 以上
+    b 面積比     … 四辺形の面積 ÷ (幅×高さ) が QUAD_MIN_AREA_RATIO 以上
+                   4点が一直線に並んでいても幅・高さは大きくなるため、
+                   サイズだけでは「つぶれた四辺形」を弾けない
+    c 凸性       … 4頂点の外積の符号がすべて同符号
+                   クリック順序を間違えると四辺形が自己交差（蝶ネクタイ型）になる
+
+  戻り値: {ok:true} または {ok:false, message:'...'}
+*/
+function validateQuad(quad){
+  const {W,H}=quadOutputSize(quad);
+
+  // a 最小サイズ
+  if(W<QUAD_MIN_SIZE || H<QUAD_MIN_SIZE){
+    return {ok:false, message:'指定した範囲が小さすぎます。フレームの辺をもっと広く囲んでください'};
+  }
+
+  // c 凸性（順序ミスの検出）— 面積比より先に見る。順序ミスは面積比も落ちるため、
+  //   より具体的な案内を優先して出す
+  const sign=[];
+  for(let i=0;i<4;i++){
+    const a=quad[i], b=quad[(i+1)%4], c=quad[(i+2)%4];
+    sign.push(Math.sign((b.x-a.x)*(c.y-b.y) - (b.y-a.y)*(c.x-b.x)));
+  }
+  /*
+    外積の符号が「正と負の両方」あるときだけ自己交差＝順序ミスと判定する。
+    完全に一直線の場合は外積がすべて0になるが、それは順序ミスではなく
+    「つぶれた四辺形」なので、ここでは弾かずに下の面積比の判定に任せる
+    （そちらの方が利用者にとって適切な案内になる）。
+  */
+  const nonZero=sign.filter(s=>s!==0);
+  const mixed = nonZero.some(s=>s>0) && nonZero.some(s=>s<0);
+  if(mixed){
+    return {ok:false, message:'点の順序が違うようです。左上 → 右上 → 右下 → 左下 の順にタップし直してください'};
+  }
+
+  // b 面積比（シューレースの公式で面積を求める）
+  let s2=0;
+  for(let i=0;i<4;i++){ const a=quad[i], b=quad[(i+1)%4]; s2 += a.x*b.y - b.x*a.y; }
+  const areaRatio = Math.abs(s2/2) / (W*H);
+  if(areaRatio < QUAD_MIN_AREA_RATIO){
+    return {ok:false, message:'4つの点が近すぎるか、一直線に並んでいます。フレームの四隅を囲むように指定し直してください'};
+  }
+
+  return {ok:true};
+}
+
+function warpQuadToRect(img, quad){
+  const {W,H}=quadOutputSize(quad);
+  if(W<2 || H<2) return null; // 数値的な安全網（通常は validateQuad が先に弾く）
 
   // 出力長方形の4隅（左上→右上→右下→左下）を、指定した4点に対応させる
   const dstCorners=[{x:0,y:0},{x:W,y:0},{x:W,y:H},{x:0,y:H}];
@@ -1259,12 +1349,14 @@ function buildTex(autoSetFw){
       指定された四辺形を射影変換で長方形に矯正し、それを切り出し帯とする。
       処理A（照明ムラ補正）より前の工程。
     */
+    // 指定された4点が使えるかを先に調べる（設計書§3.4-3）
+    const v=validateQuad(pts);
+    if(!v.ok){ showPickError(v.message); return; }
+
     const warped=warpQuadToRect(fi, pts);
     if(!warped){
-      // 4点が一直線に並んでいる等で変換できない場合
-      const el=document.getElementById('pick-status');
-      el.textContent='⚠️ この4点では矯正できません。「やり直し」でもう一度、辺の四隅を囲むように指定してください';
-      el.className='pick-status';
+      // 妥当性チェックを通ったのに解けない場合（数値的な安全網）
+      showPickError('この4点では矯正できません。「やり直し」でもう一度、辺の四隅を囲むように指定してください');
       return;
     }
     raw=warped.canvas; sw=warped.w; sh=warped.h;
