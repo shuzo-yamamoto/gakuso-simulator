@@ -16,15 +16,19 @@
 | Step 3 | 4点パース補正 | ⬜ 未着手 |
 | Step 4 | 画像エクスポート（PNG・キャプション帯・免責文言） | ⬜ 未着手 |
 
-## セットアップ
+## 使い方
 
-サーバー・ビルド不要。
+**公開URL: https://shuzo-yamamoto.github.io/gakuso-simulator/**
+
+上記URLをブラウザで開けばそのまま使えます（PC: Chrome/Edge、iPad: Safari）。
+インストール・サーバー・ビルドは不要です。
+
+### オフラインで使う場合
+
+リポジトリから `index.html` を1ファイルだけ取得すれば、単体でそのまま動作します。
 
 1. リポジトリを取得（またはZIP展開）
-2. `index.html` をブラウザで開く（PC: Chrome/Edge、iPad: Safari）
-
-GitHub Pages で公開しており、URLをブラウザで開けばそのまま利用できる。
-オフラインで使いたい場合は、リポジトリから `index.html` を1ファイルだけ取得すれば単体で動作する。
+2. `index.html` をブラウザで開く
 
 ## 検収用画像（test-images/）
 
