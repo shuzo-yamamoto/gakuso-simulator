@@ -121,6 +121,30 @@ canvas#preview{max-width:100%;border-radius:2px;box-shadow:0 4px 20px rgba(0,0,0
     </div>
     <div style="font-size:11px;color:#aaa;margin-top:4px">無地を選ぶと、辺の断面プロファイル（1画素幅の色の並び）を長手方向に押し出して貼ります。撮影ノイズの繰り返し・タイルの継ぎ目が原理的に出ません</div>
   </div>
+  <!-- v24 Step2: 照明ムラ補正（設計書§3.1・§4.1）既定はON -->
+  <div class="ctrl-box" id="lightfix-box">
+    <div class="cl">照明ムラ補正（現場撮影の明るさのかたよりをならす）</div>
+    <div class="radio-row">
+      <label><input type="checkbox" id="lightfix-on" checked onchange="setLightFix(this.checked)"/>照明ムラ補正をかける</label>
+    </div>
+    <div id="lightfix-strength-row" style="margin-top:8px">
+      <div class="cl" style="margin-bottom:4px">補正強度</div>
+      <div class="slider-row">
+        <input type="range" min="0" max="100" value="100" id="lightfix-k" step="5" oninput="document.getElementById('lightfix-k-v').textContent=this.value;onLightFixK()"/>
+        <span id="lightfix-k-v">100</span><span class="unit">%</span>
+      </div>
+      <div style="font-size:11px;color:#aaa;margin-top:4px">0%＝補正なし（v23と同じ）　100%＝明るさのかたよりを完全にならす</div>
+    </div>
+    <div style="font-size:11px;color:#aaa;margin-top:4px">スマホ撮影で辺の左右・上下の明るさが違うとき、タイルの継ぎ目に明暗の縞が出ます。これをならして目立たなくします</div>
+  </div>
+  <!-- v24 Step2: ミラータイリング（設計書§3.3・§4.1）既定ON・柄物モード時のみ表示 -->
+  <div class="ctrl-box" id="mirror-box">
+    <div class="cl">ミラータイリング（模様のつなぎ目をなくす）</div>
+    <div class="radio-row">
+      <label><input type="checkbox" id="mirror-on" checked onchange="setMirror(this.checked)"/>タイルを1枚おきに反転して貼る</label>
+    </div>
+    <div style="font-size:11px;color:#aaa;margin-top:4px">つなぎ目で模様が鏡合わせになり、継ぎ目が消えます。文字や矢印など向きのある模様で不自然なときはOFFにしてください（OFFでv23と同じ貼り方になります）</div>
+  </div>
   <div class="ctrl-box">
     <div class="cl">フレーム幅（表示の太さ）</div>
     <div class="slider-row">
@@ -344,6 +368,22 @@ let linerType='none';
   既定は 'pattern'。
 */
 let frameKind='pattern';
+
+/*
+  v24 Step2 — 照明ムラ補正（設計書§3.1・§4.1）
+  lightFixOn … チェックボックスの状態。既定ON
+  lightFixK  … 補正強度 k（0〜100%）。既定100
+  ※ lightFixOn=false または lightFixK=0 のときは処理Aを一切通さない（k=0＝補正なし）
+*/
+let lightFixOn=true;
+let lightFixK=100;
+
+/*
+  v24 Step2 — ミラータイリング（設計書§3.3・§4.1）
+  柄物モードでタイルを1枚おきに反転して継ぎ目を消す。既定ON。
+  OFF時はv23と同じ全タイル正像の配置になる（後方互換の判定条件）。
+*/
+let mirrorOn=true;
 
 // 検証関数 checkStripUniformity() 用に、最後に生成した上辺ロングストリップを保持する
 // （設計書§7.1「生成済み辺テクスチャ（上辺用ロングストリップ）」を評価対象とするため）
@@ -617,6 +657,138 @@ function resetPick(){
 */
 /*
   ═══════════════════════════════════════════════════════════════
+   v24 Step2 — 処理A: 照明ムラ補正（設計書§3.1）
+  ═══════════════════════════════════════════════════════════════
+  スマホで現場撮影すると、フレームの辺の左右・上下で明るさが変わってしまう。
+  そのままタイリングすると、明暗のかたよりが周期的に繰り返されて縞に見える。
+
+  そこで「大きくぼかした明るさの分布（＝照明マップ L）」を求め、
+  その平均 L̄ に対する比で各画素を割り戻し、明るさを平らにならす。
+  RGBに同じ係数を掛けるので、色味（色相）は変わらない。
+*/
+
+/*
+  ボックスぼかし（水平方向）— 移動和で O(画素数) で処理する
+  ─────────────────────────────────────────────────────────────
+  lx … 注目画素より左に何画素ぶん見るか
+  rx … 注目画素より右に何画素ぶん見るか
+  端は画素値を延長（clamp）して扱う。帯の端が暗く落ち込むのを防ぐため（設計書§3.1-2）
+*/
+function boxBlurH(src, dst, w, h, lx, rx){
+  const n=lx+rx+1;
+  const clamp=x=>x<0?0:(x>w-1?w-1:x);
+  for(let y=0;y<h;y++){
+    const row=y*w;
+    let sum=0;
+    for(let i=-lx;i<=rx;i++) sum+=src[row+clamp(i)];
+    for(let x=0;x<w;x++){
+      dst[row+x]=sum/n;
+      sum += src[row+clamp(x+rx+1)] - src[row+clamp(x-lx)];
+    }
+  }
+}
+
+// ボックスぼかし（垂直方向）。考え方は boxBlurH と同じで、走査方向が縦になるだけ
+function boxBlurV(src, dst, w, h, ly, ry){
+  const n=ly+ry+1;
+  const clamp=y=>y<0?0:(y>h-1?h-1:y);
+  for(let x=0;x<w;x++){
+    let sum=0;
+    for(let i=-ly;i<=ry;i++) sum+=src[clamp(i)*w+x];
+    for(let y=0;y<h;y++){
+      dst[y*w+x]=sum/n;
+      sum += src[clamp(y+ry+1)*w+x] - src[clamp(y-ly)*w+x];
+    }
+  }
+}
+
+/*
+  ガウスぼかし（ボックスぼかし3回反復による近似）— 設計書§3.1-2
+  ─────────────────────────────────────────────────────────────
+  σ が200px前後になるため真の畳み込みでは重すぎる。設計書が許容する近似を使う。
+
+  ボックスの大きさ d は W3C SVG の feGaussianBlur 仕様の式による:
+    d = floor(σ × 3 × √(2π) / 4 + 0.5)
+  d が奇数なら3回とも大きさ d（左右対称）。
+  d が偶数なら左右対称にできないため、1回目と2回目で左右の偏りを逆にして
+  half pixel のズレを打ち消し、3回目に大きさ d+1（奇数＝対称）を掛ける。
+*/
+function gaussianBlurGray(gray, w, h, sigma){
+  let d=Math.floor(sigma*3*Math.sqrt(2*Math.PI)/4 + 0.5);
+  if(d<1) d=1;
+  let passes;
+  if(d%2===1){
+    const r=(d-1)/2;
+    passes=[[r,r],[r,r],[r,r]];
+  } else {
+    const a=d/2;
+    passes=[[a,a-1],[a-1,a],[a,a]]; // 3回目は大きさ d+1（＝a+a+1）
+  }
+  // 途中は丸めずFloat32のまま保持する（設計書§3.1-2 内部精度）
+  let A=Float32Array.from(gray);
+  let B=new Float32Array(w*h);
+  for(const [l,r] of passes){
+    boxBlurH(A,B,w,h,l,r);
+    boxBlurV(B,A,w,h,l,r);
+  }
+  return A;
+}
+
+/*
+  処理A本体（設計書§3.1）
+  ─────────────────────────────────────────────────────────────
+  src … 切り出し帯（sw×sh）
+  k   … 補正強度（0〜100）
+  戻り値: 補正後の新しいCanvas（元のsrcは変更しない）
+
+  ※ 呼び出し側で k=0・補正OFF のときは本関数を呼ばないこと。
+    計算を一切通さないことで、v23との画素一致（T-2・T-5）を確実にするため。
+*/
+function applyFlatField(src, sw, sh, k){
+  const px=src.getContext('2d').getImageData(0,0,sw,sh).data;
+
+  // 1. 輝度でグレースケール化（設計書§3.1-1）
+  const gray=new Float32Array(sw*sh);
+  for(let i=0,p=0;i<gray.length;i++,p+=4){
+    gray[i]=0.299*px[p] + 0.587*px[p+1] + 0.114*px[p+2];
+  }
+
+  // 2. ガウスぼかしで照明マップ L を得る（設計書§3.1-2）
+  //    σ = max(sw,sh)/4、ただし下限8px
+  const sigma=Math.max(Math.max(sw,sh)/4, 8);
+  const L=gaussianBlurGray(gray, sw, sh, sigma);
+
+  // 3. 照明マップの全画素平均 L̄（設計書§3.1-3）
+  let total=0;
+  for(let i=0;i<L.length;i++) total+=L[i];
+  const Lbar=total/L.length;
+
+  // 4-5. 補正（設計書§3.1-4・§3.1-5）
+  const out=document.createElement('canvas');
+  out.width=sw; out.height=sh;
+  const octx=out.getContext('2d');
+  const oimg=octx.createImageData(sw,sh);
+  const od=oimg.data;
+  for(let i=0,p=0;i<L.length;i++,p+=4){
+    // RGB共通の係数。これにより色相が保たれる
+    const coef=Lbar/Math.max(L[i],1);
+    for(let c=0;c<3;c++){
+      const P=px[p+c];
+      // P' = P × L̄ / max(L,1) を 0〜255 にクリップして四捨五入
+      let Pd=P*coef;
+      if(Pd<0) Pd=0; else if(Pd>255) Pd=255;
+      Pd=Math.round(Pd);
+      // P'' = P + (P' − P) × k/100
+      od[p+c]=Math.round(P + (Pd-P)*k/100);
+    }
+    od[p+3]=px[p+3];
+  }
+  octx.putImageData(oimg,0,0);
+  return out;
+}
+
+/*
+  ═══════════════════════════════════════════════════════════════
    v24 Step1 — 処理B: プロファイル押し出し（設計書§3.2）
   ═══════════════════════════════════════════════════════════════
   無地（単色・シンプル）のフレームでは、切り出し帯をそのまま繰り返し貼ると
@@ -724,10 +896,55 @@ function extrudeProfile(prof, isHorizontal, sw, sh){
 function setFrameKind(kind){
   frameKind=kind;
   updateTexScaleUI();
+  updateMirrorUI();
+  rebuildAndRedraw();
+}
+
+/*
+  切り出し帯の作り直し＋再描画（種類切替・補正設定の変更で使う）
+  フレーム幅は利用者が調整済みの値を尊重するため、自動設定し直さない。
+*/
+function rebuildAndRedraw(){
   if(pts.length>=2){
     buildTex(false); // false = フレーム幅の自動設定をしない
     drawPreview();
   }
+}
+
+/*
+  照明ムラ補正のON/OFF（設計書§4.1）
+  切り出し帯の内容が変わるため、テクスチャを作り直してから再描画する。
+*/
+function setLightFix(on){
+  lightFixOn=on;
+  updateLightFixUI();
+  rebuildAndRedraw();
+}
+
+// 補正強度スライダーの変更（設計書§4.1）
+function onLightFixK(){
+  lightFixK=parseInt(document.getElementById('lightfix-k').value)||0;
+  rebuildAndRedraw();
+}
+
+/*
+  ミラータイリングのON/OFF（設計書§3.3・§4.1）
+  タイルの並べ方だけが変わり、切り出し帯そのものは変わらないため
+  buildTex() は不要で、再描画だけで足りる。
+*/
+function setMirror(on){
+  mirrorOn=on;
+  drawPreview();
+}
+
+// 補正強度スライダーは「照明ムラ補正ON時のみ表示」（設計書§4.1）
+function updateLightFixUI(){
+  document.getElementById('lightfix-strength-row').style.display = lightFixOn ? 'block' : 'none';
+}
+
+// ミラータイリングは柄物モードのときだけ意味を持つ（設計書§3.3 適用対象）
+function updateMirrorUI(){
+  document.getElementById('mirror-box').style.display = (frameKind==='pattern') ? 'block' : 'none';
 }
 
 /*
@@ -788,15 +1005,27 @@ function buildTex(autoSetFw){
   raw.width=sw; raw.height=sh;
   raw.getContext('2d').drawImage(fi, sx,sy,sw,sh, 0,0,sw,sh);
 
+  let base=raw;
+
+  /*
+    v24 Step2 — 処理A: 照明ムラ補正（設計書§3.1）
+    適用対象は無地・柄物の両方で、他のどの処理よりも先に実行する。
+
+    補正OFF、または補正強度 k=0 のときは applyFlatField() を呼ばずに raw をそのまま流す。
+    計算を一切通さないことで、v23との画素一致（T-2）と
+    「k=0は補正なしと画素一致」（T-5）を、丸め誤差の余地なく保証する。
+  */
+  if(lightFixOn && lightFixK>0){
+    base=applyFlatField(base, sw, sh, lightFixK);
+  }
+
   /*
     v24 Step1 — フレーム種類による前処理（設計書§3.2）
-    ・柄物（pattern）… base = raw。v23と完全に同一の画素がこの先へ流れる（後方互換）
+    ・柄物（pattern）… そのまま。補正OFF時はv23と完全に同一の画素がこの先へ流れる（後方互換）
     ・無地（plain）  … 処理B プロファイル押し出しを適用した sw×sh テクスチャに差し替える
-    ※ 照明ムラ補正（処理A）はStep 2で、この直前に挿入する
   */
-  let base=raw;
   if(frameKind==='plain'){
-    const {prof,isHorizontal}=buildProfileColumn(raw,sw,sh);
+    const {prof,isHorizontal}=buildProfileColumn(base,sw,sh);
     base=extrudeProfile(prof,isHorizontal,sw,sh);
   }
 
@@ -929,9 +1158,17 @@ function checkReady(){
   → B-10174のように上辺と左辺が正確に45°で切り替わる
 */
 
-// 辺1本分をオフスクリーンに長くタイリングして返す
-// tileCanvas: 元タイル, isVertical: 縦辺かどうか, targetLen: 辺の長さ, tileScale: スケール
-function buildLongStrip(tileCanvas, isVertical, targetLen, tileScale){
+/*
+  辺1本分をオフスクリーンに長くタイリングして返す
+  tileCanvas: 元タイル, isVertical: 縦辺かどうか, targetLen: 辺の長さ, tileScale: スケール
+  mirror: ミラータイリング（処理C・設計書§3.3）を行うか
+
+  ── 処理C: ミラータイリング（設計書§3.3）──
+  奇数番目のタイル（0起点で i=1,3,5…）を長手方向に反転して並べる。
+  こうするとタイルの境目で画素が鏡合わせになり、継ぎ目の不連続が消える。
+  mirror=false のときは v23 と全く同じ描画（全タイル正像）を通る。
+*/
+function buildLongStrip(tileCanvas, isVertical, targetLen, tileScale, mirror){
   const tw = tileCanvas.width;
   const th = tileCanvas.height;
   // タイルの繰り返し単位（スケール適用）
@@ -946,8 +1183,26 @@ function buildLongStrip(tileCanvas, isVertical, targetLen, tileScale){
   const sctx = strip.getContext('2d');
 
   for(let i=0; i<count; i++){
-    if(isVertical) sctx.drawImage(tileCanvas, 0, i*step, tw, step);
-    else           sctx.drawImage(tileCanvas, i*step, 0, step, th);
+    // 奇数番目のタイルだけ反転する（mirror=false のときは常に false）
+    const flip = mirror && (i%2===1);
+    if(!flip){
+      // ── v23と完全に同一の描画（後方互換） ──
+      if(isVertical) sctx.drawImage(tileCanvas, 0, i*step, tw, step);
+      else           sctx.drawImage(tileCanvas, i*step, 0, step, th);
+    } else {
+      // ── 反転描画（設計書§3.3-1）──
+      // タイルの終端に原点を移してから軸を反転させると、
+      // そのタイルが占める範囲にちょうど鏡像が収まる
+      sctx.save();
+      if(isVertical){
+        sctx.translate(0, i*step+step); sctx.scale(1,-1);   // 縦ストリップ: 垂直反転
+        sctx.drawImage(tileCanvas, 0, 0, tw, step);
+      } else {
+        sctx.translate(i*step+step, 0); sctx.scale(-1,1);   // 横ストリップ: 水平反転
+        sctx.drawImage(tileCanvas, 0, 0, step, th);
+      }
+      sctx.restore();
+    }
   }
   return {strip, step};
 }
@@ -989,9 +1244,11 @@ function drawPreview(){
 
   // ── ロングストリップ生成（つなぎ目を最小化）──
   // 上下辺用（横方向）：コーナーを除いた内側幅 W-F*2
-  const {strip:hStrip} = buildLongStrip(tileTopBot, false, W, tsPct);
+  // ミラータイリング（処理C）は柄物モードのときだけ適用する（設計書§3.3 適用対象）
+  const useMirror = mirrorOn && frameKind==='pattern';
+  const {strip:hStrip} = buildLongStrip(tileTopBot, false, W, tsPct, useMirror);
   // 左右辺用（縦方向）：コーナーを除いた内側高さ H-F*2
-  const {strip:vStrip} = buildLongStrip(tileSide, true, H, tsPct);
+  const {strip:vStrip} = buildLongStrip(tileSide, true, H, tsPct, useMirror);
   lastHStrip = hStrip; // 検証関数 checkStripUniformity() の評価対象（設計書§7.1）。描画結果には影響しない
 
   /*
@@ -1232,7 +1489,12 @@ function drawPreview(){
 }
 
 // ページロード時にライナープレビューを初期描画
-window.addEventListener('load', ()=>{ updateLinenPreviews(); updateTexScaleUI(); });
+window.addEventListener('load', ()=>{
+  updateLinenPreviews();
+  updateTexScaleUI();
+  updateLightFixUI();
+  updateMirrorUI();
+});
 </script>
 </body>
 </html>
