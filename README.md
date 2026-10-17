@@ -1,7 +1,7 @@
 ---
 project: gakuso-simulator
-status: 本番稼働？
-pca_renkei: true
+status: 本番稼働
+pca_renkei: false
 last_deploy:
 ---
 
