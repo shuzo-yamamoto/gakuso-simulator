@@ -75,6 +75,7 @@
 - 仕様の変更や設計の判断をしたら `docs/decisions/YYYY-MM-DD-<件名>.md` を作り、次の4つを書く:
   **背景／決定内容／却下した案とその理由／影響範囲**
 - `/codex:review` の結果は `docs/reviews/YYYY-MM-DD-<対象>.md` に保存する
+- 公開リポジトリのため、`docs/decisions/`・`docs/reviews/` にも社内固有情報（仕入先名・単価・内部URL・顧客情報・社内システム名等）を書かない。社内事情を含む判断は Vault の `_inbox` に記録する
 - 新しく作る Markdown ファイルの先頭には frontmatter を付ける:
   ```yaml
   ---
