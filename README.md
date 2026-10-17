@@ -1,3 +1,10 @@
+---
+project: gakuso-simulator
+status: 本番稼働？
+pca_renkei: true
+last_deploy:
+---
+
 # 額装シミュレーター（gakuso-simulator）
 
 コーナーサンプル画像と作品画像から額装完成イメージをCanvas合成する店頭・工房向けシミュレーター。単一HTMLファイル・完全クライアントサイド。

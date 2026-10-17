@@ -69,3 +69,17 @@
 
 各ステップの完了条件3点セット: ①コード生成 ②突合セルフレビュー報告 ③検収テスト該当項目クリア。
 揃うまで次のステップへ進まないこと。
+
+## 開発記録のルール（Obsidianで横断管理する。00_GAS業務アプリ開発標準.md §6.1）
+
+- 仕様の変更や設計の判断をしたら `docs/decisions/YYYY-MM-DD-<件名>.md` を作り、次の4つを書く:
+  **背景／決定内容／却下した案とその理由／影響範囲**
+- `/codex:review` の結果は `docs/reviews/YYYY-MM-DD-<対象>.md` に保存する
+- 新しく作る Markdown ファイルの先頭には frontmatter を付ける:
+  ```yaml
+  ---
+  project: gakuso-simulator
+  date: YYYY-MM-DD
+  tags: [decision]   # 例: decision / review / spec / handover
+  ---
+  ```
